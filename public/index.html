@@ -34,6 +34,7 @@
   <form id="f">
     <input id="url" type="url" placeholder="Paste download link" required autocomplete="off">
     <input id="fn" type="text" placeholder="Filename (optional)" autocomplete="off">
+    <input id="conn" type="number" min="1" max="32" inputmode="numeric" placeholder="Connections (default 8)">
     <button type="submit">Start download</button>
   </form>
   <div id="list"></div>
@@ -67,7 +68,7 @@ function render(jobs) {
     const pct = j.total ? Math.min(100, (j.received / j.total) * 100) : 0;
     const barCls = j.status === 'done' ? 'done' : (!j.total && j.status === 'downloading' ? 'indeterminate' : '');
     let status = j.status;
-    if (j.status === 'downloading') status = `${fmt(j.speed)}/s${eta(j)}`;
+    if (j.status === 'downloading') status = `${fmt(j.speed)}/s${eta(j)}${j.mode === 'segmented' ? ' · ' + j.connections + 'x' : ''}`;
     if (j.status === 'queued' && j.error) status = 'retrying…';
     let btns = '';
     if (j.status === 'done') btns += `<a class="primary" href="/files/${j.id}">Download file</a>`;
@@ -91,7 +92,11 @@ async function del(id) { if (confirm('Remove this download and delete the file?'
 $('#f').addEventListener('submit', async (e) => {
   e.preventDefault();
   try {
-    await api('/api/jobs', 'POST', { url: $('#url').value, filename: $('#fn').value || undefined });
+    await api('/api/jobs', 'POST', {
+      url: $('#url').value,
+      filename: $('#fn').value || undefined,
+      connections: $('#conn').value ? parseInt($('#conn').value, 10) : undefined,
+    });
     $('#url').value = ''; $('#fn').value = '';
     refresh();
   } catch (err) { alert(err.message); }
