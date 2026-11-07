@@ -513,6 +513,156 @@ function stopJob(job, to) {
   else job.status = to;
 }
 
+// ---------- link resolving ----------
+// Turns what you paste (a repo, a release page, a share link, a web page that lists
+// files) into a direct file URL, or a list of files to pick from.
+const GITHUB_API = process.env.GITHUB_API || 'https://api.github.com';
+const FILE_EXTS = new Set(
+  (
+    'zip 7z rar iso img bin cue tar gz tgz bz2 xz zst exe msi dmg pkg deb rpm apk ipa appimage ' +
+    'pdf epub mp4 mkv avi mov webm mp3 flac wav ogg m4a chd cso rvz wbfs gcz'
+  ).split(' ')
+);
+const timeout = () => AbortSignal.timeout(20000);
+
+async function ghJson(apiPath) {
+  const headers = { 'User-Agent': 'background-downloader', Accept: 'application/vnd.github+json' };
+  if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  const res = await fetch(GITHUB_API + apiPath, { headers, signal: timeout() });
+  if (res.status === 404) throw new Error('GitHub says that repo or release does not exist (or it is private).');
+  if (res.status === 403 || res.status === 429) {
+    throw new Error('GitHub is rate limiting this server right now. Try again in a bit.');
+  }
+  if (!res.ok) throw new Error(`GitHub responded ${res.status}`);
+  return res.json();
+}
+
+async function resolveGithub(parts) {
+  const owner = parts[0];
+  const repo = parts[1].replace(/\.git$/, '');
+  const section = parts[2];
+  const archive = (ref) => `https://github.com/${owner}/${repo}/archive/${ref}.zip`;
+
+  if (section === 'blob' && parts.length >= 5) {
+    return { kind: 'direct', url: `https://raw.githubusercontent.com/${owner}/${repo}/${parts.slice(3).join('/')}` };
+  }
+  if (section === 'releases' && parts[3] !== 'download') {
+    const tag = parts[3] === 'tag' && parts[4] ? decodeURIComponent(parts[4]) : null;
+    const rel = await ghJson(
+      `/repos/${owner}/${repo}/releases/${tag ? 'tags/' + encodeURIComponent(tag) : 'latest'}`
+    );
+    const choices = (rel.assets || []).map((a) => ({
+      name: a.name,
+      url: a.browser_download_url,
+      size: a.size,
+    }));
+    const source = archive(`refs/tags/${rel.tag_name}`);
+    if (choices.length === 0) return { kind: 'direct', url: source };
+    if (choices.length === 1) return { kind: 'direct', url: choices[0].url };
+    choices.push({ name: `Source code (${rel.tag_name}).zip`, url: source });
+    return { kind: 'choices', title: `${repo} ${rel.name || rel.tag_name}`, choices };
+  }
+  if (section === 'tree' && parts[3]) return { kind: 'direct', url: archive(`refs/heads/${parts[3]}`) };
+  if (!section) return { kind: 'direct', url: archive('HEAD') };
+  return null; // archive/raw/etc: let the generic handling deal with it
+}
+
+// share links that need a tweak to become real downloads
+function rewriteKnown(u) {
+  const host = u.hostname.replace(/^www\./, '');
+  if (host === 'dropbox.com') {
+    u.searchParams.delete('dl');
+    u.searchParams.set('dl', '1');
+    return u.href;
+  }
+  if (host === 'huggingface.co' && u.pathname.includes('/blob/')) {
+    u.pathname = u.pathname.replace('/blob/', '/resolve/');
+    return u.href;
+  }
+  if (host === 'drive.google.com') {
+    const m = u.pathname.match(/\/file\/d\/([\w-]+)/);
+    const id = m ? m[1] : u.searchParams.get('id');
+    if (id) return `https://drive.usercontent.google.com/download?id=${id}&export=download&confirm=t`;
+  }
+  return null;
+}
+
+async function readLimited(res, limit) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let out = '';
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.length;
+    out += dec.decode(value, { stream: true });
+    if (size >= limit) {
+      await reader.cancel().catch(() => {});
+      break;
+    }
+  }
+  return out;
+}
+
+// A plain file link passes straight through. A web page gets scanned for file links.
+async function sniff(url) {
+  const res = await fetch(url, {
+    headers: { 'User-Agent': UA, Range: 'bytes=0-0' },
+    redirect: 'follow',
+    signal: timeout(),
+  });
+  const type = (res.headers.get('content-type') || '').toLowerCase();
+  const finalUrl = res.url || url;
+  try {
+    await res.body?.cancel();
+  } catch {}
+  if (!res.ok) throw new Error(`The server responded ${res.status} ${res.statusText}.`);
+  if (!/text\/html|application\/xhtml/.test(type)) return { kind: 'direct', url };
+
+  const page = await fetch(finalUrl, { headers: { 'User-Agent': UA }, redirect: 'follow', signal: timeout() });
+  if (!page.ok) throw new Error(`The server responded ${page.status} ${page.statusText}.`);
+  const html = await readLimited(page, 2 * 1024 * 1024);
+
+  const seen = new Map();
+  for (const m of html.matchAll(/href\s*=\s*["']([^"']+)["']/gi)) {
+    let link;
+    try {
+      link = new URL(m[1].replace(/&amp;/g, '&'), finalUrl);
+    } catch {
+      continue;
+    }
+    link.hash = '';
+    if (!/^https?:$/.test(link.protocol)) continue;
+    const ext = path.extname(link.pathname).slice(1).toLowerCase();
+    if (!FILE_EXTS.has(ext) || seen.has(link.href)) continue;
+    seen.set(link.href, { name: nameFromUrl(link.href), url: link.href });
+    if (seen.size >= 40) break;
+  }
+  const choices = [...seen.values()];
+  if (choices.length === 0) {
+    throw new Error(
+      "That link is a web page, not a file, and I couldn't find any downloadable files on it. " +
+        "Use the file's direct download link instead."
+    );
+  }
+  if (choices.length === 1) return { kind: 'direct', url: choices[0].url };
+  return { kind: 'choices', title: 'Pick a file', choices };
+}
+
+async function resolveLink(input) {
+  const u = new URL(input);
+  const host = u.hostname.replace(/^www\./, '');
+  const parts = u.pathname.split('/').filter(Boolean);
+  if (host === 'github.com' && parts.length >= 2) {
+    const r = await resolveGithub(parts);
+    if (r) return r;
+  }
+  const rewritten = rewriteKnown(new URL(input));
+  if (rewritten) return { kind: 'direct', url: rewritten };
+  return sniff(u.href);
+}
+
 // ---------- http ----------
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
 const safeEq = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
@@ -707,6 +857,24 @@ const server = http.createServer(async (req, res) => {
         if (!['http:', 'https:'].includes(target.protocol)) throw new Error();
       } catch {
         return json(res, 400, { error: 'Enter a valid http(s) URL' });
+      }
+      if (!body.direct) {
+        let resolved;
+        try {
+          resolved = await resolveLink(target.href);
+        } catch (e) {
+          const msg =
+            e.name === 'TimeoutError'
+              ? 'That link took too long to respond.'
+              : e.message === 'fetch failed'
+                ? "Couldn't reach that site. Check the link."
+                : e.message;
+          return json(res, 400, { error: msg || 'Could not read that link' });
+        }
+        if (resolved.kind === 'choices') {
+          return json(res, 200, { title: resolved.title, choices: resolved.choices });
+        }
+        target = new URL(resolved.url);
       }
       const custom = body.filename ? sanitize(String(body.filename)) : null;
       const connections = Math.min(

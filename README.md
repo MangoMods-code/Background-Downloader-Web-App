@@ -24,6 +24,14 @@ Open the site in Safari → **Share → Add to Home Screen**. It opens full scre
 - Wrong passwords are rate limited (10 tries per 15 minutes).
 - The tab title shows active downloads and total speed, e.g. `↓ 2 · 18 MB/s`.
 
+## Links it understands
+
+- Direct file links.
+- GitHub: a repo (downloads the default branch as a zip), a branch (`/tree/dev`), a single file (`/blob/...`), or a releases page (`/releases/latest` or a specific tag). If a release has several files you pick one.
+- Hugging Face file pages, Dropbox share links, and public Google Drive file links (best effort; Drive can refuse very large or restricted files).
+- Ordinary web pages: it looks for download links on the page (zip, iso, 7z, mp4, pdf and so on) and lets you pick. Pages that hide the file behind a button, form, captcha or login can't be followed. For those, use the file's direct link.
+- Optional: set `GITHUB_TOKEN` in Railway to avoid GitHub's rate limit on release lookups.
+
 ## Notes
 
 - Make sure your volume is bigger than the files you download (ISOs can be several GB).
