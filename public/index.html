@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Downloader</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#262a33; --text:#e8eaf0; --dim:#8b92a3; --accent:#5b9dff; --ok:#3ecf8e; --bad:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 -apple-system,system-ui,Segoe UI,Roboto,sans-serif; }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:8px 0 16px; }
+  form { display:grid; gap:8px; margin-bottom:20px; }
+  input { width:100%; padding:12px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--text); font-size:16px; }
+  button { padding:12px 16px; border-radius:10px; border:0; background:var(--accent); color:#fff; font-size:16px; font-weight:600; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; margin-bottom:10px; }
+  .name { font-weight:600; word-break:break-all; }
+  .meta { color:var(--dim); font-size:13px; margin-top:4px; }
+  .bar { height:8px; background:var(--line); border-radius:99px; overflow:hidden; margin:10px 0 4px; }
+  .bar > div { height:100%; background:var(--accent); transition:width .5s; }
+  .bar.done > div { background:var(--ok); }
+  .bar.indeterminate > div { width:30% !important; animation:slide 1.2s infinite linear; }
+  @keyframes slide { from { margin-left:-30%; } to { margin-left:100%; } }
+  .row { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+  .row button, .row a { padding:8px 12px; font-size:14px; background:var(--line); color:var(--text); border-radius:8px; text-decoration:none; border:0; }
+  .row a.primary { background:var(--ok); color:#06210f; font-weight:600; }
+  .err { color:var(--bad); font-size:13px; margin-top:4px; }
+  .empty { color:var(--dim); text-align:center; padding:30px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Background downloader</h1>
+  <form id="f">
+    <input id="url" type="url" placeholder="Paste download link" required autocomplete="off">
+    <input id="fn" type="text" placeholder="Filename (optional)" autocomplete="off">
+    <button type="submit">Start download</button>
+  </form>
+  <div id="list"></div>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const fmt = (n) => {
+  if (n == null) return '?';
+  const u = ['B','KB','MB','GB','TB']; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i > 1 ? 2 : 0) + ' ' + u[i];
+};
+const eta = (j) => {
+  if (!j.speed || !j.total) return '';
+  const s = Math.round((j.total - j.received) / j.speed);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return ' · ' + (h ? h + 'h ' : '') + m + 'm left';
+};
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function api(path, method = 'GET', body) {
+  const r = await fetch(path, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || 'Request failed');
+  return data;
+}
+
+function render(jobs) {
+  if (!jobs.length) { $('#list').innerHTML = '<div class="empty">No downloads yet</div>'; return; }
+  $('#list').innerHTML = jobs.map((j) => {
+    const pct = j.total ? Math.min(100, (j.received / j.total) * 100) : 0;
+    const barCls = j.status === 'done' ? 'done' : (!j.total && j.status === 'downloading' ? 'indeterminate' : '');
+    let status = j.status;
+    if (j.status === 'downloading') status = `${fmt(j.speed)}/s${eta(j)}`;
+    if (j.status === 'queued' && j.error) status = 'retrying…';
+    let btns = '';
+    if (j.status === 'done') btns += `<a class="primary" href="/files/${j.id}">Download file</a>`;
+    if (j.status === 'downloading' || j.status === 'queued') btns += `<button onclick="act('${j.id}','pause')">Pause</button>`;
+    if (j.status === 'paused' || j.status === 'failed') btns += `<button onclick="act('${j.id}','resume')">Resume</button>`;
+    btns += `<button onclick="del('${j.id}')">Remove</button>`;
+    return `<div class="card">
+      <div class="name">${esc(j.filename)}</div>
+      <div class="bar ${barCls}"><div style="width:${j.status === 'done' ? 100 : pct}%"></div></div>
+      <div class="meta">${fmt(j.received)} / ${fmt(j.total)}${j.total ? ' (' + pct.toFixed(1) + '%)' : ''} · ${esc(status)}</div>
+      ${j.error && j.status !== 'done' ? `<div class="err">${esc(j.error)}</div>` : ''}
+      <div class="row">${btns}</div>
+    </div>`;
+  }).join('');
+}
+
+async function refresh() { try { render(await api('/api/jobs')); } catch {} }
+async function act(id, a) { await api(`/api/jobs/${id}/${a}`, 'POST'); refresh(); }
+async function del(id) { if (confirm('Remove this download and delete the file?')) { await api(`/api/jobs/${id}`, 'DELETE'); refresh(); } }
+
+$('#f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    await api('/api/jobs', 'POST', { url: $('#url').value, filename: $('#fn').value || undefined });
+    $('#url').value = ''; $('#fn').value = '';
+    refresh();
+  } catch (err) { alert(err.message); }
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
