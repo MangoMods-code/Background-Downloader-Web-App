@@ -34,6 +34,12 @@ if (!PASSWORD) {
 
 fs.mkdirSync(FILES_DIR, { recursive: true });
 
+// Login session: one long-lived cookie derived from the password.
+// Changing PASSWORD logs everyone out.
+const COOKIE_NAME = 'dl_session';
+const COOKIE_MAX_AGE = 180 * 24 * 3600; // 180 days
+const SESSION_TOKEN = crypto.createHmac('sha256', PASSWORD).update('dl-session-v1').digest('hex');
+
 // ---------- state ----------
 let jobs = [];
 try {
@@ -141,6 +147,7 @@ async function probe(job, signal) {
   const info = {
     supported: false,
     total: null,
+    size: null,
     finalUrl: res.url || job.url,
     nameHeader: nameFromHeaders(res),
   };
@@ -158,7 +165,11 @@ async function probe(job, signal) {
       info.total = parseInt(m[1], 10);
       info.supported = true;
     }
+  } else {
+    const len = parseInt(res.headers.get('content-length') || '', 10);
+    if (!isNaN(len)) info.size = len;
   }
+  if (info.total) info.size = info.total;
   try {
     await res.body?.cancel();
   } catch {}
@@ -262,7 +273,14 @@ async function runSegmented(job, info, connections, ctrl) {
               await fetchChunk(job, job.chunks[idx], info.finalUrl, inner.signal, fh);
               break;
             } catch (e) {
-              if (inner.signal.aborted || e.fatal || e.status === 429 || e.status === 503 || tries >= 3) {
+              if (
+                inner.signal.aborted ||
+                e.fatal ||
+                e.code === 'ENOSPC' ||
+                e.status === 429 ||
+                e.status === 503 ||
+                tries >= 3
+              ) {
                 throw e;
               }
               await sleep(1000 * tries, inner.signal);
@@ -358,6 +376,49 @@ async function runSingle(job, ctrl) {
   }
 }
 
+function fmtBytes(n) {
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return n.toFixed(i > 1 ? 1 : 0) + ' ' + u[i];
+}
+
+// free / total bytes on the volume (null if the platform can't tell us)
+async function diskStats() {
+  try {
+    const st = await fs.promises.statfs(FILES_DIR);
+    return { free: st.bavail * st.bsize, total: st.blocks * st.bsize };
+  } catch {
+    return null;
+  }
+}
+
+// Refuse up front if the file can't fit, instead of failing hours in.
+async function checkSpace(job, info) {
+  if (!info.size) return;
+  const st = await diskStats();
+  if (!st) return;
+  let have = 0;
+  if (job.chunks) have = job.received || 0;
+  else {
+    try {
+      have = fs.statSync(partPath(job)).size;
+    } catch {}
+  }
+  const need = Math.max(0, info.size - have);
+  if (st.free < need + 64 * 1024 * 1024) {
+    const e = new Error(
+      `Not enough space on the volume: needs ${fmtBytes(need)} more but only ${fmtBytes(st.free)} is free. ` +
+        'Remove old files or enlarge the volume, then hit Resume.'
+    );
+    e.noRetry = true;
+    throw e;
+  }
+}
+
 async function runJob(job) {
   const ctrl = new AbortController();
   controllers.set(job.id, ctrl);
@@ -385,6 +446,8 @@ async function runJob(job) {
       job.nameResolved = true;
     }
 
+    await checkSpace(job, info);
+
     const connections = job.connections || DEFAULT_CONNECTIONS;
     const segmented =
       info.supported && info.total >= MIN_SEGMENT_BYTES && (connections > 1 || job.chunks);
@@ -404,6 +467,16 @@ async function runJob(job) {
     if (ctrl.signal.aborted) {
       job.status = job.abortTo || 'paused';
     } else {
+      if (err.code === 'ENOSPC') {
+        err.message = 'The volume is full. Remove old files or enlarge the volume, then hit Resume.';
+        err.noRetry = true;
+      }
+      if (err.noRetry) {
+        // retrying can't fix this one
+        job.status = 'failed';
+        job.error = err.message;
+        return;
+      }
       // host is rejecting us for too many connections: back off to fewer
       const current = job.connections || DEFAULT_CONNECTIONS;
       if (job.mode === 'segmented' && (err.status === 429 || err.status === 503) && current > 1) {
@@ -441,13 +514,36 @@ function stopJob(job, to) {
 }
 
 // ---------- http ----------
+const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
+const safeEq = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
+
+function checkPassword(pass) {
+  return safeEq(pass, PASSWORD);
+}
+
+function parseCookies(req) {
+  const out = {};
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+
+// Logged in = valid session cookie (the login page sets it). HTTP Basic still works too.
 function authOk(req) {
+  const cookie = parseCookies(req)[COOKIE_NAME];
+  if (cookie && safeEq(cookie, SESSION_TOKEN)) return true;
   const h = req.headers.authorization || '';
   if (!h.startsWith('Basic ')) return false;
   const pass = Buffer.from(h.slice(6), 'base64').toString().split(':').slice(1).join(':');
-  const a = crypto.createHash('sha256').update(pass).digest();
-  const b = crypto.createHash('sha256').update(PASSWORD).digest();
-  return crypto.timingSafeEqual(a, b);
+  return checkPassword(pass);
+}
+
+// last entry is the one added by Railway's proxy, so it can't be spoofed by the client
+function clientIp(req) {
+  const xff = (req.headers['x-forwarded-for'] || '').split(',').pop().trim();
+  return xff || req.socket.remoteAddress || 'unknown';
 }
 
 function json(res, code, obj) {
@@ -511,19 +607,92 @@ function serveFile(req, res, job) {
   fs.createReadStream(fp).pipe(res);
 }
 
-const server = http.createServer(async (req, res) => {
-  if (!authOk(req)) {
-    res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Downloader"' });
-    return res.end('Auth required');
-  }
+// Public on purpose: the phone fetches the icon and manifest without cookies when
+// adding to the Home Screen. None of it contains anything private.
+const PUBLIC_FILES = {
+  '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'],
+  '/apple-touch-icon.png': ['apple-touch-icon.png', 'image/png'],
+  '/icon-192.png': ['icon-192.png', 'image/png'],
+  '/icon-512.png': ['icon-512.png', 'image/png'],
+  '/login': ['login.html', 'text/html; charset=utf-8'],
+};
 
+function sendPublic(res, name, type, noStore) {
+  const fp = path.join(__dirname, 'public', name);
+  fs.stat(fp, (err, st) => {
+    if (err) {
+      res.writeHead(404);
+      return res.end('Not found');
+    }
+    res.writeHead(200, {
+      'Content-Type': type,
+      'Content-Length': st.size,
+      'Cache-Control': noStore ? 'no-store' : 'public, max-age=3600',
+    });
+    fs.createReadStream(fp).pipe(res);
+  });
+}
+
+const loginAttempts = new Map(); // ip -> { count, resetAt }
+const MAX_LOGIN_ATTEMPTS = 10;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
 
   try {
+    if (req.method === 'GET' && PUBLIC_FILES[p]) {
+      return sendPublic(res, ...PUBLIC_FILES[p]);
+    }
+
+    if (req.method === 'POST' && p === '/api/login') {
+      const ip = clientIp(req);
+      const now = Date.now();
+      const rec = loginAttempts.get(ip);
+      const live = rec && now < rec.resetAt ? rec : null;
+      if (live && live.count >= MAX_LOGIN_ATTEMPTS) {
+        return json(res, 429, { error: 'Too many attempts. Try again in a few minutes.' });
+      }
+      const body = await readBody(req).catch(() => ({}));
+      if (checkPassword(String(body.password || ''))) {
+        loginAttempts.delete(ip);
+        const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+        res.setHeader(
+          'Set-Cookie',
+          `${COOKIE_NAME}=${SESSION_TOKEN}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE}${secure}`
+        );
+        return json(res, 200, { ok: true });
+      }
+      const cur = live || { count: 0, resetAt: now + LOGIN_WINDOW_MS };
+      cur.count++;
+      loginAttempts.set(ip, cur);
+      return json(res, 401, { error: 'Wrong password' });
+    }
+
+    if (req.method === 'POST' && p === '/api/logout') {
+      res.setHeader('Set-Cookie', `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+      return json(res, 200, { ok: true });
+    }
+
+    if (!authOk(req)) {
+      if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
+        return sendPublic(res, 'login.html', 'text/html; charset=utf-8', true);
+      }
+      if (req.method === 'GET' && !p.startsWith('/api/')) {
+        res.writeHead(302, { Location: '/' });
+        return res.end();
+      }
+      return json(res, 401, { error: 'Not logged in' });
+    }
+
     if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       return fs.createReadStream(path.join(__dirname, 'public', 'index.html')).pipe(res);
+    }
+
+    if (req.method === 'GET' && p === '/api/stats') {
+      return json(res, 200, (await diskStats()) || {});
     }
 
     if (req.method === 'GET' && p === '/api/jobs') {

@@ -12,7 +12,17 @@ Paste a link, the server downloads it in the background, and you grab the file w
    - `DATA_DIR` = `/data`
    - `MAX_CONCURRENT` = `2` (optional, files downloading at once)
    - `CONNECTIONS` = `8` (optional, connections per file; can also be set per download in the form)
-5. **Settings → Networking → Generate Domain**, then open the URL. Your browser will ask for a login: any username, your `PASSWORD` as the password.
+5. **Settings → Networking → Generate Domain**, then open the URL and log in with your `PASSWORD`.
+
+## Add to Home Screen (iPhone)
+
+Open the site in Safari → **Share → Add to Home Screen**. It opens full screen like an app. Log in once inside the Home Screen app (it keeps its own login, separate from Safari) and it stays logged in for about 6 months. The login is a single shared password, so you and a friend can both use it. Changing `PASSWORD` in Railway logs everyone out.
+
+## What it does for you
+
+- Shows free space on the volume at the top, and refuses a download up front if it won't fit.
+- Wrong passwords are rate limited (10 tries per 15 minutes).
+- The tab title shows active downloads and total speed, e.g. `↓ 2 · 18 MB/s`.
 
 ## Notes
 
