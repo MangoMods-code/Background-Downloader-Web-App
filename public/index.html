@@ -40,6 +40,8 @@
   .row a.primary { background:var(--ok); color:#06210f; font-weight:600; }
   .err { color:var(--bad); font-size:13px; margin-top:4px; }
   .empty { color:var(--dim); text-align:center; padding:30px 0; }
+  .picker .row { margin-top:6px; }
+  .picker .row button { width:100%; text-align:left; word-break:break-all; }
 </style>
 </head>
 <body>
@@ -50,11 +52,12 @@
   </header>
   <div class="disk" id="disk"></div>
   <form id="f">
-    <input id="url" type="url" placeholder="Paste download link" required autocomplete="off">
+    <input id="url" type="url" placeholder="Paste a link (file, GitHub repo, Dropbox, Drive…)" required autocomplete="off">
     <input id="fn" type="text" placeholder="Filename (optional)" autocomplete="off">
     <input id="conn" type="number" min="1" max="32" inputmode="numeric" placeholder="Connections (default 8)">
     <button type="submit">Start download</button>
   </form>
+  <div id="picker"></div>
   <div id="list"></div>
 </main>
 <script>
@@ -126,17 +129,39 @@ async function refresh() {
 async function act(id, a) { await api(`/api/jobs/${id}/${a}`, 'POST'); refresh(); }
 async function del(id) { if (confirm('Remove this download and delete the file?')) { await api(`/api/jobs/${id}`, 'DELETE'); refresh(); } }
 
-$('#f').addEventListener('submit', async (e) => {
-  e.preventDefault();
+let pickerChoices = [];
+let pickerConn;
+function closePicker() { $('#picker').innerHTML = ''; pickerChoices = []; }
+function showPicker(title, choices, conn) {
+  pickerChoices = choices; pickerConn = conn;
+  $('#picker').innerHTML = `<div class="card picker">
+    <div class="name">${esc(title || 'Pick a file')}</div>
+    <div class="meta">This link has more than one file. Pick one:</div>
+    ${choices.map((c, i) => `<div class="row"><button onclick="pick(${i})">${esc(c.name)}${c.size ? ' · ' + fmt(c.size) : ''}</button></div>`).join('')}
+    <div class="row"><button onclick="closePicker()">Cancel</button></div>
+  </div>`;
+}
+async function pick(i) {
+  const c = pickerChoices[i];
   try {
-    await api('/api/jobs', 'POST', {
-      url: $('#url').value,
-      filename: $('#fn').value || undefined,
-      connections: $('#conn').value ? parseInt($('#conn').value, 10) : undefined,
-    });
-    $('#url').value = ''; $('#fn').value = '';
+    await api('/api/jobs', 'POST', { url: c.url, direct: true, connections: pickerConn });
+    closePicker(); $('#url').value = ''; $('#fn').value = '';
     refresh();
   } catch (err) { alert(err.message); }
+}
+
+$('#f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = $('#f button[type=submit]');
+  btn.disabled = true; btn.textContent = 'Checking link…';
+  try {
+    const conn = $('#conn').value ? parseInt($('#conn').value, 10) : undefined;
+    const out = await api('/api/jobs', 'POST', { url: $('#url').value, filename: $('#fn').value || undefined, connections: conn });
+    if (out.choices) { showPicker(out.title, out.choices, conn); return; }
+    closePicker(); $('#url').value = ''; $('#fn').value = '';
+    refresh();
+  } catch (err) { alert(err.message); }
+  finally { btn.disabled = false; btn.textContent = 'Start download'; }
 });
 
 $('#logout').addEventListener('click', async () => {
