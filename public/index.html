@@ -2,14 +2,28 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Downloader">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="/icon-192.png">
 <title>Downloader</title>
 <style>
-  :root { --bg:#0f1115; --card:#181b22; --line:#262a33; --text:#e8eaf0; --dim:#8b92a3; --accent:#5b9dff; --ok:#3ecf8e; --bad:#ff6b6b; }
+  :root { --bg:#0f1115; --card:#181b22; --line:#262a33; --text:#e8eaf0; --dim:#8b92a3; --accent:#5b9dff; --ok:#3ecf8e; --bad:#ff6b6b; --warn:#f5b84b; }
   * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 -apple-system,system-ui,Segoe UI,Roboto,sans-serif; }
-  main { max-width:640px; margin:0 auto; padding:16px; }
-  h1 { font-size:20px; margin:8px 0 16px; }
+  html, body { touch-action: manipulation; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;
+         padding:max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
+  main { max-width:640px; margin:0 auto; }
+  header { display:flex; align-items:center; justify-content:space-between; margin:4px 0 4px; }
+  h1 { font-size:20px; margin:0; }
+  .linkbtn { background:none; color:var(--dim); font-size:14px; font-weight:400; padding:6px 0 6px 12px; border-radius:0; }
+  .disk { color:var(--dim); font-size:13px; margin-bottom:16px; }
+  .disk.warn { color:var(--warn); }
   form { display:grid; gap:8px; margin-bottom:20px; }
   input { width:100%; padding:12px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--text); font-size:16px; }
   button { padding:12px 16px; border-radius:10px; border:0; background:var(--accent); color:#fff; font-size:16px; font-weight:600; }
@@ -30,7 +44,11 @@
 </head>
 <body>
 <main>
-  <h1>Background downloader</h1>
+  <header>
+    <h1>Background downloader</h1>
+    <button class="linkbtn" id="logout" type="button">Log out</button>
+  </header>
+  <div class="disk" id="disk"></div>
   <form id="f">
     <input id="url" type="url" placeholder="Paste download link" required autocomplete="off">
     <input id="fn" type="text" placeholder="Filename (optional)" autocomplete="off">
@@ -57,6 +75,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;'
 
 async function api(path, method = 'GET', body) {
   const r = await fetch(path, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  if (r.status === 401) { location.href = '/'; throw new Error('Not logged in'); }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || 'Request failed');
   return data;
@@ -85,7 +104,25 @@ function render(jobs) {
   }).join('');
 }
 
-async function refresh() { try { render(await api('/api/jobs')); } catch {} }
+function renderDisk(st) {
+  const el = $('#disk');
+  if (!st || !st.total) { el.textContent = ''; return; }
+  el.textContent = `Storage: ${fmt(st.free)} free of ${fmt(st.total)}`;
+  el.classList.toggle('warn', st.free / st.total < 0.1);
+}
+
+function updateTitle(jobs) {
+  const active = jobs.filter((j) => j.status === 'downloading');
+  const speed = active.reduce((a, j) => a + (j.speed || 0), 0);
+  document.title = active.length ? `↓ ${active.length} · ${fmt(speed)}/s` : 'Downloader';
+}
+
+async function refresh() {
+  try {
+    const [jobs, st] = await Promise.all([api('/api/jobs'), api('/api/stats')]);
+    render(jobs); renderDisk(st); updateTitle(jobs);
+  } catch {}
+}
 async function act(id, a) { await api(`/api/jobs/${id}/${a}`, 'POST'); refresh(); }
 async function del(id) { if (confirm('Remove this download and delete the file?')) { await api(`/api/jobs/${id}`, 'DELETE'); refresh(); } }
 
@@ -102,8 +139,14 @@ $('#f').addEventListener('submit', async (e) => {
   } catch (err) { alert(err.message); }
 });
 
+$('#logout').addEventListener('click', async () => {
+  try { await api('/api/logout', 'POST'); } catch {}
+  location.href = '/';
+});
+
 refresh();
-setInterval(refresh, 2000);
+setInterval(() => { if (!document.hidden) refresh(); }, 2000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 </script>
 </body>
 </html>
